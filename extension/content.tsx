@@ -1,6 +1,6 @@
 import type { PlasmoCSConfig } from "plasmo"
 import * as React from "react"
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 export const config: PlasmoCSConfig = {
   matches: ["https://*.twitter.com/*", "https://*.x.com/*"]
@@ -69,41 +69,70 @@ const Sidebar = () => {
   const [newFilter, setNewFilter] = useState("")
   const [tweets, setTweets] = useState<TweetInfo[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const lastUpdateRef = useRef<number>(0)
+  const processingRef = useRef<boolean>(false)
 
   const extractTweets = useCallback(() => {
-    const tweetTexts = document.querySelectorAll("div[lang]")
-    const newTweets: TweetInfo[] = []
+    // Prevent rapid re-extractions
+    const now = Date.now()
+    if (now - lastUpdateRef.current < 500) {
+      return tweets
+    }
+    lastUpdateRef.current = now
 
-    tweetTexts.forEach((element, index) => {
-      if (element.textContent && element.textContent.trim()) {
-        const articleParent = element.closest("article")
-        if (articleParent) {
-          newTweets.push({
-            text: element.textContent.trim(),
-            element: articleParent as HTMLElement,
-            index,
-            metadata: extractTweetMetadata(articleParent as HTMLElement)
-          })
-        }
+    // Find all tweet articles first
+    const articles = document.querySelectorAll('article[data-testid="tweet"]')
+    const newTweets: TweetInfo[] = []
+    const seenArticles = new Set<HTMLElement>()
+
+    articles.forEach((article, index) => {
+      if (seenArticles.has(article as HTMLElement)) return
+
+      // Find the main tweet text div
+      const tweetText = article.querySelector('div[data-testid="tweetText"]')
+      if (tweetText?.textContent?.trim()) {
+        seenArticles.add(article as HTMLElement)
+        newTweets.push({
+          text: tweetText.textContent.trim(),
+          element: article as HTMLElement,
+          index,
+          metadata: extractTweetMetadata(article as HTMLElement)
+        })
       }
     })
 
-    setTweets(newTweets)
-    return newTweets
-  }, [])
+    console.log("Extracted tweets:", newTweets.length) // Debug log
+
+    // Only update state if tweets have actually changed
+    if (
+      JSON.stringify(newTweets.map((t) => t.text)) !==
+      JSON.stringify(tweets.map((t) => t.text))
+    ) {
+      setTweets(newTweets)
+      return newTweets
+    }
+    return tweets
+  }, [tweets])
 
   const applyFilters = useCallback(
     async (currentTweets: TweetInfo[], currentFilters: string[]) => {
+      if (processingRef.current) return
+      if (currentTweets.length === 0) return // Don't process if no tweets
+      processingRef.current = true
+
       if (currentFilters.length === 0) {
-        // If no filters, show all tweets
         currentTweets.forEach((tweet) => {
-          tweet.element.style.display = "block"
+          if (tweet.element.style.display !== "block") {
+            tweet.element.style.display = "block"
+          }
         })
+        processingRef.current = false
         return
       }
 
       setIsLoading(true)
       try {
+        console.log("Sending tweets to API:", currentTweets.length) // Debug log
         const response = await fetch(API_ENDPOINT, {
           method: "POST",
           headers: {
@@ -123,52 +152,86 @@ const Sidebar = () => {
         }
 
         const { passedIndices } = await response.json()
+        console.log("Received passed indices:", passedIndices) // Debug log
 
-        // Hide all tweets first
+        // Update display states only if they need to change
         currentTweets.forEach((tweet) => {
-          tweet.element.style.display = "none"
-        })
+          const shouldShow = passedIndices.includes(tweet.index)
+          const isCurrentlyShown = tweet.element.style.display === "block"
 
-        // Show only tweets that passed all filters
-        passedIndices.forEach((index) => {
-          const tweet = currentTweets.find((t) => t.index === index)
-          if (tweet) {
-            tweet.element.style.display = "block"
+          if (shouldShow !== isCurrentlyShown) {
+            tweet.element.style.display = shouldShow ? "block" : "none"
           }
         })
       } catch (error) {
         console.error("Error applying filters:", error)
       } finally {
         setIsLoading(false)
+        processingRef.current = false
       }
     },
     []
   )
 
   useEffect(() => {
-    // Initial tweet extraction
-    const initialTweets = extractTweets()
+    // Wait for Twitter to load its content
+    const timeout = setTimeout(() => {
+      const initialTweets = extractTweets()
+      if (initialTweets.length > 0) {
+        applyFilters(initialTweets, filters)
+      }
+    }, 2000)
+
+    // Debounced observer callback
+    let timeoutId: NodeJS.Timeout
+    const debouncedExtract = () => {
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(() => {
+        if (!processingRef.current) {
+          const newTweets = extractTweets()
+          if (newTweets !== tweets && newTweets.length > 0) {
+            applyFilters(newTweets, filters)
+          }
+        }
+      }, 500)
+    }
 
     // Set up observer for new tweets
-    const observer = new MutationObserver(() => {
-      const newTweets = extractTweets()
-      applyFilters(newTweets, filters)
+    const observer = new MutationObserver((mutations) => {
+      // Only process if mutations affect the tweet content
+      const hasRelevantChanges = mutations.some(
+        (mutation) =>
+          mutation.target.nodeType === Node.ELEMENT_NODE &&
+          (mutation.target as Element).closest('article[data-testid="tweet"]')
+      )
+
+      if (hasRelevantChanges) {
+        debouncedExtract()
+      }
     })
 
     const mainContent = document.querySelector("main")
     if (mainContent) {
       observer.observe(mainContent, {
         childList: true,
-        subtree: true
+        subtree: true,
+        attributes: false,
+        characterData: false
       })
     }
 
-    return () => observer.disconnect()
-  }, [extractTweets, applyFilters, filters])
+    return () => {
+      observer.disconnect()
+      clearTimeout(timeoutId)
+      clearTimeout(timeout)
+    }
+  }, [extractTweets, applyFilters, filters, tweets])
 
   // Apply filters whenever they change
   useEffect(() => {
-    applyFilters(tweets, filters)
+    if (!processingRef.current) {
+      applyFilters(tweets, filters)
+    }
   }, [tweets, filters, applyFilters])
 
   const handleSave = () => {
